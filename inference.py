@@ -5,9 +5,14 @@ import requests
 import argparse
 import numpy as np
 from PIL import Image
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 from transformers import OwlViTProcessor, OwlViTForObjectDetection
 
+from metrics.localization import loc_metric
+
 import torch, gc
+from torchvision.ops import box_convert
 gc.collect()
 torch.cuda.empty_cache()
 
@@ -16,13 +21,15 @@ if torch.cuda.is_available():
 else:
     device = torch.device("cpu")
     
-score_threshold = 0.1 # TODO
+grit_score_threshold = 0.1
+coco_score_threshold = 0.0
+plot_score_threshold = 0.1
 
 
 def plot_outputs(image, queries, scores, boxes, labels, color=(0,255,0)):
     image = np.asarray(image.copy())
     for score, box, label in zip(scores, boxes, labels):
-        if score < score_threshold:
+        if score < plot_score_threshold:
             continue
         box_int = list(map(int, box))
         x1y1 = (box_int[0], box_int[1])
@@ -32,6 +39,92 @@ def plot_outputs(image, queries, scores, boxes, labels, color=(0,255,0)):
                             (box_int[0]+3, box_int[1]+25), 1, 1.5, color, 1, cv2.LINE_AA)
     image = Image.fromarray(image)
     return image    
+
+
+def inference_coco(args, model, processor):
+    img_base_path = f"{args.coco_path}/images/val2017"
+    annt_path = f"{args.coco_path}/annotations/instances_val2017.json"
+    
+    with open(annt_path, 'r') as f:
+        annts = json.load(f)
+        item_infos = annts['annotations']
+        
+    categories = dict()
+    for x in annts['categories']:
+        categories[x['id']] = x['name']
+    
+    with torch.no_grad():
+        output_json = []
+        targets = item_infos[:200]
+        grit_task_metrics = []
+        for i, item_info in enumerate(targets):
+            if i%100==0:
+                print(f"{i}/{len(targets)}th item processing...")
+                
+            image_id = item_info['image_id']
+            category_id = item_info['category_id']
+                
+            img_path = f"{img_base_path}/{image_id:012}.jpg"
+            image = Image.open(img_path).convert("RGB")
+            text = [categories[category_id]]     
+                
+            inputs = processor(images=image, text=text, return_tensors="pt").to(device)
+            outputs = model(**inputs)
+            
+            target_sizes = torch.Tensor([image.size[::-1]]).to(device)
+            grit_results = processor.post_process_object_detection(outputs=outputs,
+                                                                   target_sizes=target_sizes,
+                                                                   threshold=grit_score_threshold)[0]
+            
+            coco_results = processor.post_process_object_detection(outputs=outputs,
+                                                                   target_sizes=target_sizes,
+                                                                   threshold=coco_score_threshold)[0]
+            
+            # run grit metric
+            grit_gt = box_convert(torch.as_tensor(item_infos[i]['bbox']),
+                                  in_fmt='xywh', out_fmt='xyxy').tolist()
+            grit_metric = loc_metric(grit_results["boxes"], [grit_gt])
+            grit_task_metrics.append(grit_metric)
+            
+            # save pred in coco format
+            boxes = box_convert(coco_results["boxes"], in_fmt='xyxy', out_fmt='xywh')
+            scores = coco_results["scores"]
+            boxes = boxes.cpu().detach().numpy().tolist()
+            scores = scores.cpu().detach().numpy().tolist()
+            for box, score in zip(boxes, scores):
+                output_json.append({
+                    'image_id': image_id,
+                    'category_id': category_id,
+                    'bbox': list(map(lambda x: round(x, 1), box)),
+                    'score': float(score)
+                })
+        print()
+    
+    output_dir = f"{args.output_base}/coco"
+    os.makedirs(output_dir, exist_ok=True)
+    pred_file_path = f"{output_dir}/coco2017_val.json"
+    with open(pred_file_path, 'w') as f:
+        json.dump(output_json, f)
+        
+    """
+    Run COCO Evaluation
+    """
+    coco_annt_path = './annts/coco_val2017_small.json'
+    coco_gt = COCO(coco_annt_path)
+    coco_pred = coco_gt.loadRes(pred_file_path)
+    
+    coco_eval = COCOeval(coco_gt, coco_pred, 'bbox')
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
+    print()
+    
+    """
+    Run GRIT Localization Metric
+    """
+    mean_grit_task_metric = sum(grit_task_metrics)/len(grit_task_metrics)
+    print(f"mean GRIT localization metric: {mean_grit_task_metric}")
+    
 
 
 def inference_grit(args, model, processor):
@@ -66,7 +159,7 @@ def inference_grit(args, model, processor):
             target_sizes = torch.Tensor([image.size[::-1]]).to(device)
             results = processor.post_process_object_detection(outputs=outputs,
                                                               target_sizes=target_sizes,
-                                                              threshold=score_threshold)[0]
+                                                              threshold=coco_score_threshold)[0]
             boxes = results["boxes"].cpu().detach().numpy()
             scores = results["scores"].cpu().detach().numpy()
             output_json.append({
@@ -99,8 +192,7 @@ def inference_images(args, model, processor):
         
         target_sizes = torch.Tensor([image.size[::-1]]).to(device)
         results = processor.post_process_object_detection(outputs=outputs,
-                                                          target_sizes=target_sizes,
-                                                          threshold=score_threshold)[0]
+                                                          target_sizes=target_sizes)[0]
         boxes, scores, labels = results["boxes"], results["scores"], results["labels"]
         boxes = boxes.cpu().detach().numpy()
         scores = scores.cpu().detach().numpy()
@@ -136,6 +228,13 @@ def parse_args():
                         default="ablation",
                         type=str,
                         help='which split to work on')
+    
+    parser.add_argument("--coco",
+                        action='store_true')
+    parser.add_argument("--coco_path",
+                        default='/home/seongsu/data/dataset/COCO2017',
+                        type=str,
+                        help='path to COCO')
 
     args = parser.parse_args()
     return args
@@ -146,6 +245,8 @@ def main(args):
     model = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32").to(device)
     if args.grit:
         inference_grit(args, model, processor)
+    elif args.coco:
+        inference_coco(args, model, processor)
     else:
         inference_images(args, model, processor)
     print("Inference Done.")    
